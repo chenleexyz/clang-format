@@ -56,6 +56,31 @@ of the buffer."
   :safe #'stringp)
 (make-variable-buffer-local 'clang-format-style)
 
+(defconst clang-format--git-diff-summary-re "^@@ -[0-9,]+ \\+\\([0-9]+\\)\\(,\\([0-9]+\\)\\)?")
+
+(defun clang-format--parse-git-diff-to-changed-regions (diff-result-lines)
+  (let ((ranges nil))
+    (dolist (line diff-result-lines)
+      (when (string-match clang-format--git-diff-summary-re line)
+        (setq ranges (add-to-list 'ranges
+                                  (let ((start (string-to-int (match-string 1 line)))
+                                        (length (string-to-int (if-let ((len (match-string 3 line))) len "1"))))
+                                    ;; clang-format -liens start:end, the end is inclusive
+                                    `(,start . ,(+ start (- length 1))))
+                                  t))))
+    ranges))
+
+(defun clang-format--git-diff-changed-regions (file-path)
+  (let ((diff-result (shell-command-to-string
+                      (concat "cd " (file-name-directory file-path)
+                              " && git diff HEAD -U0 -- "
+                              (file-name-nondirectory file-path)))))
+    (clang-format--parse-git-diff-to-changed-regions (split-string diff-result "\n"))))
+
+(defun clang-format--git-diff-buffer-changed-regions (buffer-name)
+  (interactive "b")
+  (clang-format--git-diff-changed-regions (buffer-file-name (get-buffer buffer-name))))
+
 (defun clang-format--extract (xml-node)
   "Extract replacements and cursor information from XML-NODE."
   (unless (and (listp xml-node) (eq (xml-node-name xml-node) 'replacements))
@@ -119,16 +144,22 @@ is a zero-based file offset, assuming ‘utf-8-unix’ coding."
       (byte-to-position (1+ byte)))))
 
 ;;;###autoload
-(defun clang-format-region (start end &optional style assume-file-name)
-  "Use clang-format to format the code between START and END according to STYLE.
+(defun clang-format-region (regions count-by-lines &optional style assume-file-name)
+  "Use clang-format to format the code in REGIONS according to STYLE.
 If called interactively uses the region or the current statement if there is no
 no active region. If no STYLE is given uses `clang-format-style'. Use
 ASSUME-FILE-NAME to locate a style config file, if no ASSUME-FILE-NAME is given
 uses the function `buffer-file-name'."
   (interactive
    (if (use-region-p)
-       (list (region-beginning) (region-end))
-     (list (point) (point))))
+       (list (list `(,(clang-format--bufferpos-to-filepos (region-beginning) 'approximate 'utf-8-unix) .
+                     ,(clang-format--bufferpos-to-filepos (region-end) 'approximate 'utf-8-unix)))
+             nil)
+     (list (list `(,(clang-format--bufferpos-to-filepos (point) 'approximate 'utf-8-unix) .
+                   ,(clang-format--bufferpos-to-filepos (point) 'approximate 'utf-8-unix)))
+           nil)))
+
+  (unless regions (return))
 
   (unless style
     (setq style clang-format-style))
@@ -136,11 +167,7 @@ uses the function `buffer-file-name'."
   (unless assume-file-name
     (setq assume-file-name buffer-file-name))
 
-  (let ((file-start (clang-format--bufferpos-to-filepos start 'approximate
-                                                        'utf-8-unix))
-        (file-end (clang-format--bufferpos-to-filepos end 'approximate
-                                                      'utf-8-unix))
-        (cursor (clang-format--bufferpos-to-filepos (point) 'exact 'utf-8-unix))
+  (let ((cursor (clang-format--bufferpos-to-filepos (point) 'exact 'utf-8-unix))
         (temp-buffer (generate-new-buffer " *clang-format-temp*"))
         (temp-file (make-temp-file "clang-format"))
         ;; Output is XML, which is always UTF-8.  Input encoding should match
@@ -149,26 +176,33 @@ uses the function `buffer-file-name'."
         ;; always use ‘utf-8-unix’ and ignore the buffer coding system.
         (default-process-coding-system '(utf-8-unix . utf-8-unix)))
     (unwind-protect
-        (let ((status (apply #'call-process-region
-                             nil nil clang-format-executable
-                             nil `(,temp-buffer ,temp-file) nil
-                             `("-output-replacements-xml"
-                               ;; Guard against a nil assume-file-name.
-                               ;; If the clang-format option -assume-filename
-                               ;; is given a blank string it will crash as per
-                               ;; the following bug report
-                               ;; https://bugs.llvm.org/show_bug.cgi?id=34667
-                               ,@(and assume-file-name
-                                      (list "-assume-filename" assume-file-name))
-                               "-style" ,style
-                               "-offset" ,(number-to-string file-start)
-                               "-length" ,(number-to-string (- file-end file-start))
-                               "-cursor" ,(number-to-string cursor))))
-              (stderr (with-temp-buffer
-                        (unless (zerop (cadr (insert-file-contents temp-file)))
-                          (insert ": "))
-                        (buffer-substring-no-properties
-                         (point-min) (line-end-position)))))
+        (let* ((clang-format-region-options (mapcan (lambda (pair)
+                                                      (let ((start (car pair)) (end (cdr pair)))
+                                                        (if count-by-lines
+                                                            (list "-lines" (concat (number-to-string start) ":" (number-to-string end)))
+                                                          (list "-offset" (number-to-string start)
+                                                                "-length" (number-to-string (- end start))))))
+                                                    regions))
+               (status (apply #'call-process-region
+                              nil nil clang-format-executable
+                              nil `(,temp-buffer ,temp-file) nil
+                              (append
+                               `("-output-replacements-xml"
+                                 ;; Guard against a nil assume-file-name.
+                                 ;; If the clang-format option -assume-filename
+                                 ;; is given a blank string it will crash as per
+                                 ;; the following bug report
+                                 ;; https://bugs.llvm.org/show_bug.cgi?id=34667
+                                 ,@(and assume-file-name
+                                        (list "-assume-filename" assume-file-name))
+                                 "-style"  ,style
+                                 "-cursor" ,(number-to-string cursor))
+                               clang-format-region-options)))
+               (stderr (with-temp-buffer
+                         (unless (zerop (cadr (insert-file-contents temp-file)))
+                           (insert ": "))
+                         (buffer-substring-no-properties
+                          (point-min) (line-end-position)))))
           (cond
            ((stringp status)
             (error "(clang-format killed by signal %s%s)" status stderr))
@@ -197,7 +231,18 @@ If no STYLE is given uses `clang-format-style'. Use ASSUME-FILE-NAME
 to locate a style config file. If no ASSUME-FILE-NAME is given uses
 the function `buffer-file-name'."
   (interactive)
-  (clang-format-region (point-min) (point-max) style assume-file-name))
+  (clang-format-region (list `(,(clang-format--bufferpos-to-filepos (point-min) 'approximate 'utf-8-unix) .
+                               ,(clang-format--bufferpos-to-filepos (point-max) 'approximate 'utf-8-unix)))
+                       nil style assume-file-name))
+
+;;;###autoload
+(defun git-clang-format-buffer (&optional style assume-file-name)
+  "Use clang-format to format the changed part of current buffer according to STYLE.
+If no STYLE is given uses `clang-format-style'. Use ASSUME-FILE-NAME
+to locate a style config file. If no ASSUME-FILE-NAME is given uses
+the function `buffer-file-name'."
+  (interactive)
+  (clang-format-region (clang-format--git-diff-buffer-changed-regions (buffer-name)) t style assume-file-name))
 
 ;;;###autoload
 (defalias 'clang-format 'clang-format-region)
