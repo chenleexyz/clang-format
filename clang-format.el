@@ -62,12 +62,13 @@ of the buffer."
   (let ((ranges nil))
     (dolist (line diff-result-lines)
       (when (string-match clang-format--git-diff-summary-re line)
-        (setq ranges (add-to-list 'ranges
-                                  (let ((start (string-to-int (match-string 1 line)))
-                                        (length (string-to-int (if-let ((len (match-string 3 line))) len "1"))))
-                                    ;; clang-format -liens start:end, the end is inclusive
-                                    `(,start . ,(+ start (- length 1))))
-                                  t))))
+        (let ((start (string-to-int (match-string 1 line)))
+              (length (string-to-int (if-let ((len (match-string 3 line))) len "1"))))
+          (if (>= length 1)
+              (setq ranges (add-to-list 'ranges
+                                        ;; clang-format -liens start:end, the end is inclusive
+                                        `(,start . ,(+ start (- length 1)))
+                    t))))))
     ranges))
 
 (defun clang-format--git-diff-changed-regions (file-path)
